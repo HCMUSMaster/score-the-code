@@ -9,10 +9,27 @@ from openai import OpenAI
 from tqdm import tqdm
 from utils.metrics import evaluate_all, save_metrics
 
-INPUT_TSV = "./datasets/ASAP-SAS/train.tsv"
+DATASETS = {
+    "sas": {
+        "path": "./datasets/ASAP-SAS/train.tsv",
+        "prompt_dir": "./prompts/ASAP-SAS/DataSet{}",
+        "set_col": "EssaySet",
+        "essay_col": "EssayText",
+        "gold_col": "Score1",
+        "out_dir": "./outputs/ASAP-SAS",
+    },
+    "aes": {
+        "path": "./datasets/ASAP-AES/training_set_rel3.tsv",
+        "prompt_dir": "./prompts/ASAP-AES/EssaySet{}",
+        "set_col": "essay_set",
+        "essay_col": "essay",
+        "gold_col": "domain1_score",
+        "out_dir": "./outputs/ASAP-AES",
+    },
+}
 
-PROMPT_DIR = "./prompts/ASAP-SAS"
 MODEL = "gpt-4o"
+MAX_RATING = 3
 BASE_URL = "https://api.openai.com/v1"
 TEST_ROWS = 5
 SLEEP_S = 0.2
@@ -147,7 +164,7 @@ def agent2_score(essay_text: str, extraction: dict) -> dict:
         s = int(got.get("score", 0))
     except (ValueError, TypeError):
         s = 0
-    return {"score": max(0, min(3, s)), "raw": got}
+    return {"score": max(0, min(MAX_RATING, s)), "raw": got}
 
 
 # ---------- Agent 3: Feedback (optional) ----------
@@ -176,7 +193,10 @@ Return only the feedback text (<=80 words)."""
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="AutoSCORE multi-agent scoring")
-    parser.add_argument("--set", type=int, default=2, help="essay set number (default: 2)")
+    parser.add_argument("--ds", choices=sorted(DATASETS), default="sas", help="dataset: sas or aes (default: sas)")
+    parser.add_argument(
+        "--set", type=int, default=None, help="essay set number (default: 2 for sas, 1 for aes)"
+    )
     parser.add_argument("--model", default=MODEL, help="model name (default: gpt-4o)")
     parser.add_argument(
         "--base-url",
@@ -185,24 +205,28 @@ if __name__ == "__main__":
     )
     args = parser.parse_args()
     MODEL = args.model
+    ds = DATASETS[args.ds]
+    if args.set is None:
+        args.set = 2 if args.ds == "sas" else 1
 
-    set_dir = f"{PROMPT_DIR}/DataSet{args.set}"
+    set_dir = ds["prompt_dir"].format(args.set)
     PROMPT_EXTRACTOR = read_text(f"{set_dir}/prompt_extractor_agent.txt")
     PROMPT_SCORING = read_text(f"{set_dir}/prompt_scoring_agent.txt")
     QUESTION_TEXT = read_text(f"{set_dir}/question.txt")
     RUBRIC_TEXT = read_text(f"{set_dir}/rubric.txt")
-    OUTPUT_CSV = f"./outputs/ASAP-SAS/{MODEL.replace('/', '-')}_Set{args.set}.csv"
+    OUTPUT_CSV = f"{ds['out_dir']}/{MODEL.replace('/', '-')}_Set{args.set}.csv"
 
     client = OpenAI(api_key=API_KEY, base_url=args.base_url)
 
-    df = pd.read_csv(INPUT_TSV, sep="\t")
-    df = df[df["EssaySet"] == args.set].copy()
+    df = pd.read_csv(ds["path"], sep="\t")
+    df = df[df[ds["set_col"]] == args.set].copy()
+    MAX_RATING = int(df[ds["gold_col"]].max())
     if TEST_ROWS is not None:
         df = df.head(TEST_ROWS).copy()
 
     rows = []
     for _, r in tqdm(df.iterrows(), total=len(df), desc="Multi-agent"):
-        essay = str(r["EssayText"])
+        essay = str(r[ds["essay_col"]])
         a1 = agent1_extract(essay)
         a2 = agent2_score(essay, a1)
         fb = agent3_feedback(essay, a1, a2) if WRITE_FEEDBACK else ""
@@ -214,7 +238,7 @@ if __name__ == "__main__":
                 "PredScore": a2["score"],
                 "ScorerRaw": json.dumps(a2["raw"], ensure_ascii=False),
                 "Feedback": fb,
-                "GoldScore": int(r["Score1"]),
+                "GoldScore": int(r[ds["gold_col"]]),
             }
         )
         time.sleep(SLEEP_S)
@@ -236,7 +260,7 @@ if __name__ == "__main__":
 
     y_true = out["GoldScore"].astype(int).tolist()
     y_pred = out["PredScore"].astype(int).tolist()
-    m = evaluate_all(y_true, y_pred, max_rating=3)
+    m = evaluate_all(y_true, y_pred, max_rating=MAX_RATING)
     print(f"Rows evaluated: {len(out)}")
     print(f"QWK:         {m['QWK']:.4f}")
     print(f"Pearson:     {m['Pearson']:.4f}")

@@ -105,9 +105,13 @@ def quadratic_weighted_kappa(y_true: Sequence, y_pred: Sequence, max_rating: int
     return float(1.0 - (num / den if den != 0 else 1.0))
 
 
+def _constant(a: np.ndarray) -> bool:
+    return len(np.unique(a)) < 2
+
+
 def pearson_corr(y_true: Sequence, y_pred: Sequence) -> float:
     yt = _to_float_array(y_true); yp = _to_float_array(y_pred)
-    if len(yt) < 2:
+    if len(yt) < 2 or _constant(yt) or _constant(yp):
         return float("nan")
     if pearsonr is not None:
         r, _ = pearsonr(yt, yp); return float(r[0] if isinstance(r, tuple) else r)
@@ -117,7 +121,7 @@ def pearson_corr(y_true: Sequence, y_pred: Sequence) -> float:
 
 def spearman_corr(y_true: Sequence, y_pred: Sequence) -> float:
     yt = _to_float_array(y_true); yp = _to_float_array(y_pred)
-    if len(yt) < 2:
+    if len(yt) < 2 or _constant(yt) or _constant(yp):
         return float("nan")
     if spearmanr is not None:
         r, _ = spearmanr(yt, yp); return float(r[0] if isinstance(r, tuple) else r)
@@ -131,7 +135,7 @@ def spearman_corr(y_true: Sequence, y_pred: Sequence) -> float:
 
 def kendall_tau_corr(y_true: Sequence, y_pred: Sequence) -> float:
     yt = _to_float_array(y_true); yp = _to_float_array(y_pred)
-    if len(yt) < 2:
+    if len(yt) < 2 or _constant(yt) or _constant(yp):
         return float("nan")
     if kendalltau is not None:
         r, _ = kendalltau(yt, yp); return float(r[0] if isinstance(r, tuple) else r)
