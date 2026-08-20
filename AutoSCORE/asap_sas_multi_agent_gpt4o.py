@@ -1,11 +1,14 @@
 import argparse
+import glob
 import json
 import os
 import re
 import time
 
+import instructor
 import pandas as pd
 from openai import OpenAI
+from pydantic import BaseModel
 from tqdm import tqdm
 from utils.metrics import evaluate_all, save_metrics
 
@@ -17,6 +20,7 @@ DATASETS = {
         "essay_col": "EssayText",
         "gold_col": "Score1",
         "out_dir": "./outputs/ASAP-SAS",
+        "encoding": "utf-8",
     },
     "aes": {
         "path": "./datasets/ASAP-AES/training_set_rel3.tsv",
@@ -25,14 +29,15 @@ DATASETS = {
         "essay_col": "essay",
         "gold_col": "domain1_score",
         "out_dir": "./outputs/ASAP-AES",
+        "encoding": "latin-1",
     },
 }
 
 MODEL = "gpt-4o"
 MAX_RATING = 3
 BASE_URL = "https://api.openai.com/v1"
-TEST_ROWS = 5
 SLEEP_S = 0.2
+MAX_TOKENS = 8192
 WRITE_FEEDBACK = False
 API_KEY = os.environ.get("OPENAI_API_KEY", None)
 
@@ -42,103 +47,65 @@ def read_text(p):
         return f.read()
 
 
-def parse_json(text, default):
-    text = (text or "").strip()
-    if text.startswith("```"):
-        text = text.split("\n", 1)[-1].rsplit("```", 1)[0].strip()
-    try:
-        return json.loads(text)
-    except (ValueError, TypeError, json.JSONDecodeError):
-        m = re.search(r"\{.*\}", text, flags=re.DOTALL)
-        return json.loads(m.group(0)) if m else default
-
-
 def norm_list(xs):
     return sorted({(x or "").strip().lower() for x in (xs or []) if x})
 
 
-# ---------------- Provider-native structured output ----------------
-# Fallback chain: json_schema -> json_object -> plain text.
-# parse_json stays as final net: some models ignore response_format entirely.
-EXTRACT_SCHEMA = {
-    "type": "object",
-    "properties": {
-        "conclusions": {"type": "array", "items": {"type": "string"}},
-        "design_improvements": {"type": "array", "items": {"type": "string"}},
-        "validity_improvements": {"type": "array", "items": {"type": "string"}},
-        "valid_conclusion": {"type": "boolean"},
-    },
-    "required": [
-        "conclusions",
-        "design_improvements",
-        "validity_improvements",
-        "valid_conclusion",
-    ],
-}
+# ---------------- Structured output models ----------------
+class Extraction(BaseModel):
+    conclusions: list[str] = []
+    design_improvements: list[str] = []
+    validity_improvements: list[str] = []
+    valid_conclusion: bool = False
 
-SCORE_SCHEMA = {
-    "type": "object",
-    "properties": {
-        "score": {"type": "integer"},
-        "reasoning": {"type": "string"},
-    },
-    "required": ["score", "reasoning"],
-}
 
-def chat_json(messages, schema=None):
-    """Native JSON mode when provider supports it; degrade gracefully."""
-    if schema is not None:
-        try:
-            return client.chat.completions.create(
-                model=MODEL,
-                temperature=0,
-                messages=messages,
-                response_format={
-                    "type": "json_schema",
-                    "json_schema": {"name": "result", "schema": schema, "strict": True},
-                },
-            )
-        except Exception:  # noqa: BLE001 - provider may not support json_schema
-            pass  # fall through to json_object
-    try:
-        return client.chat.completions.create(
-            model=MODEL,
-            temperature=0,
-            messages=messages,
-            response_format={"type": "json_object"},
-        )
-    except Exception:  # noqa: BLE001 - provider may not support json_object either
-        return client.chat.completions.create(
-            model=MODEL, temperature=0, messages=messages
-        )
+class Score(BaseModel):
+    score: int
+    reasoning: str
+
+
+class Feedback(BaseModel):
+    text: str
+
+
+def discover_sets(ds):
+    pattern = ds["prompt_dir"].replace("{}", "*")
+    found = []
+    for p in sorted(glob.glob(pattern)):
+        m = re.search(r"(\d+)$", os.path.basename(p.rstrip(os.sep)))
+        if m:
+            found.append(int(m.group(1)))
+    return found
+
 
 # ---------------- Agent 1: Extract ----------------
 def agent1_extract(essay_text: str) -> dict:
     user_prompt = PROMPT_EXTRACTOR.format(
         question=QUESTION_TEXT, rubric=RUBRIC_TEXT, essay_text=essay_text
     )
-    # print("\n--- Prompt ---")
-    # print(user_prompt)
-    # print("--------------")
-    resp = chat_json(
-        [
-            {
-                "role": "system",
-                "content": "You are Insight Extractor. Output JSON only; no prose.",
-            },
-            {"role": "user", "content": user_prompt},
-        ],
-        schema=EXTRACT_SCHEMA,
-    )
-    data = parse_json(resp.choices[0].message.content, {})
-    if not isinstance(data, dict):
-        data = {}
-    data["conclusions"] = norm_list(data.get("conclusions"))
-    data["design_improvements"] = norm_list(data.get("design_improvements"))
-    data["validity_improvements"] = norm_list(data.get("validity_improvements"))
+    try:
+        ext = client.chat.completions.create(
+            model=MODEL,
+            temperature=0,
+            max_tokens=MAX_TOKENS,
+            messages=[
+                {
+                    "role": "system",
+                    "content": "You are Insight Extractor. Output JSON only; no prose.",
+                },
+                {"role": "user", "content": user_prompt},
+            ],
+            response_model=Extraction,
+        )
+    except Exception as e:  # noqa: BLE001 - keep run alive on provider errors
+        print(f"[agent1] extraction failed, using empty: {e}")
+        ext = Extraction()
+    data = ext.model_dump()
+    for k in ("conclusions", "design_improvements", "validity_improvements"):
+        data[k] = norm_list(data[k])
     data["design_count"] = len(data["design_improvements"])
     data["validity_count"] = len(data["validity_improvements"])
-    data["valid_conclusion"] = bool(data.get("valid_conclusion"))
+    data["valid_conclusion"] = bool(data["valid_conclusion"])
     return data
 
 
@@ -150,21 +117,22 @@ def agent2_score(essay_text: str, extraction: dict) -> dict:
         essay_text=essay_text,
         extraction_json=json.dumps(extraction, ensure_ascii=False),
     )
-    resp = chat_json(
-        [
-            {"role": "system", "content": "You are Score Judge. Return JSON only."},
-            {"role": "user", "content": user_prompt},
-        ],
-        schema=SCORE_SCHEMA,
-    )
-    got = parse_json(resp.choices[0].message.content, {})
-    if not isinstance(got, dict):
-        got = {}
     try:
-        s = int(got.get("score", 0))
-    except (ValueError, TypeError):
-        s = 0
-    return {"score": max(0, min(MAX_RATING, s)), "raw": got}
+        sc = client.chat.completions.create(
+            model=MODEL,
+            temperature=0,
+            max_tokens=MAX_TOKENS,
+            messages=[
+                {"role": "system", "content": "You are Score Judge. Return JSON only."},
+                {"role": "user", "content": user_prompt},
+            ],
+            response_model=Score,
+        )
+    except Exception as e:  # noqa: BLE001 - keep run alive on provider errors
+        print(f"[agent2] scoring failed, defaulting to 0: {e}")
+        sc = Score(score=0, reasoning="")
+    s = max(0, min(MAX_RATING, sc.score))
+    return {"score": s, "raw": {"score": sc.score, "reasoning": sc.reasoning}}
 
 
 # ---------- Agent 3: Feedback (optional) ----------
@@ -182,50 +150,34 @@ def agent3_feedback(essay_text: str, extraction: dict, scoring: dict) -> str:
 # Agent2 Score
 {json.dumps(scoring, ensure_ascii=False)}
 
-Return only the feedback text (<=80 words)."""
+Return JSON only: {"text": "feedback (<=80 words)"}"""
     resp = client.chat.completions.create(
         model=MODEL,
         temperature=0.5,
         messages=[{"role": "system", "content": sys}, {"role": "user", "content": usr}],
+        response_model=Feedback,
     )
-    return (resp.choices[0].message.content or "").strip()
+    return resp.text
 
 
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="AutoSCORE multi-agent scoring")
-    parser.add_argument("--ds", choices=sorted(DATASETS), default="sas", help="dataset: sas or aes (default: sas)")
-    parser.add_argument(
-        "--set", type=int, default=None, help="essay set number (default: 2 for sas, 1 for aes)"
-    )
-    parser.add_argument("--model", default=MODEL, help="model name (default: gpt-4o)")
-    parser.add_argument(
-        "--base-url",
-        default=BASE_URL,
-        help="OpenAI-compatible base URL (default: https://api.openai.com/v1)",
-    )
-    args = parser.parse_args()
-    MODEL = args.model
-    ds = DATASETS[args.ds]
-    if args.set is None:
-        args.set = 2 if args.ds == "sas" else 1
+def run_set(ds_name, ds, set_num, test_only, client):
+    global PROMPT_EXTRACTOR, PROMPT_SCORING, QUESTION_TEXT, RUBRIC_TEXT, MAX_RATING
 
-    set_dir = ds["prompt_dir"].format(args.set)
+    set_dir = ds["prompt_dir"].format(set_num)
     PROMPT_EXTRACTOR = read_text(f"{set_dir}/prompt_extractor_agent.txt")
     PROMPT_SCORING = read_text(f"{set_dir}/prompt_scoring_agent.txt")
     QUESTION_TEXT = read_text(f"{set_dir}/question.txt")
     RUBRIC_TEXT = read_text(f"{set_dir}/rubric.txt")
-    OUTPUT_CSV = f"{ds['out_dir']}/{MODEL.replace('/', '-')}_Set{args.set}.csv"
+    OUTPUT_CSV = f"{ds['out_dir']}/{MODEL.replace('/', '-')}_Set{set_num}.csv"
 
-    client = OpenAI(api_key=API_KEY, base_url=args.base_url)
-
-    df = pd.read_csv(ds["path"], sep="\t")
-    df = df[df[ds["set_col"]] == args.set].copy()
+    df = pd.read_csv(ds["path"], sep="\t", encoding=ds["encoding"])
+    df = df[df[ds["set_col"]] == set_num].copy()
     MAX_RATING = int(df[ds["gold_col"]].max())
-    if TEST_ROWS is not None:
-        df = df.head(TEST_ROWS).copy()
+    if test_only:
+        df = df.head(1).copy()
 
     rows = []
-    for _, r in tqdm(df.iterrows(), total=len(df), desc="Multi-agent"):
+    for _, r in tqdm(df.iterrows(), total=len(df), desc=f"{ds_name}/Set{set_num}"):
         essay = str(r[ds["essay_col"]])
         a1 = agent1_extract(essay)
         a2 = agent2_score(essay, a1)
@@ -273,3 +225,55 @@ if __name__ == "__main__":
     metrics_path = OUTPUT_CSV.replace(".csv", "_metrics.json")
     save_metrics(metrics_path, m)
     print(f"Saved metrics to {metrics_path}")
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="AutoSCORE multi-agent scoring")
+    parser.add_argument(
+        "--ds",
+        nargs="+",
+        choices=sorted(DATASETS) + ["all"],
+        default=["all"],
+        help="dataset(s) to run, or 'all' (default: all)",
+    )
+    parser.add_argument(
+        "--set",
+        type=int,
+        default=None,
+        help="essay set number (default: all sets in dataset)",
+    )
+    parser.add_argument("--model", default=MODEL, help="model name")
+    parser.add_argument(
+        "--base-url",
+        default=BASE_URL,
+        help="OpenAI-compatible base URL (default: https://api.openai.com/v1)",
+    )
+    parser.add_argument(
+        "--max-tokens",
+        type=int,
+        default=MAX_TOKENS,
+        help="max output tokens (default: 8192; reasoning models need headroom)",
+    )
+    parser.add_argument(
+        "--test",
+        action="store_true",
+        help="consume only 1 item per set (avoid many LLM calls)",
+    )
+    args = parser.parse_args()
+
+    MODEL = args.model
+    MAX_TOKENS = args.max_tokens
+    client = instructor.from_openai(
+        OpenAI(api_key=API_KEY, base_url=args.base_url), mode=instructor.Mode.MD_JSON
+    )
+
+    ds_names = sorted(DATASETS) if "all" in args.ds else args.ds
+
+    for ds_name in ds_names:
+        ds = DATASETS[ds_name]
+        sets = [args.set] if args.set is not None else discover_sets(ds)
+        if not sets:
+            print(f"No prompt sets found for {ds_name}; skipping")
+            continue
+        for set_num in sets:
+            run_set(ds_name, ds, set_num, args.test, client)
