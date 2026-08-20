@@ -1,9 +1,9 @@
 {
   "Accuracy": "0.000",
-  "AdjAccuracy": "0.600",
-  "MAE": "1.800",
-  "MSE": "4.200",
-  "RMSE": "2.049",
+  "AdjAccuracy": "1.000",
+  "MAE": "1.000",
+  "MSE": "1.000",
+  "RMSE": "1.000",
   "CohenKappa": "0.000",
   "QWK": "0.000",
   "Pearson": "nan",

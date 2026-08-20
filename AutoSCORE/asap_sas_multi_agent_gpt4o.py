@@ -40,6 +40,7 @@ SLEEP_S = 0.2
 MAX_TOKENS = 8192
 WRITE_FEEDBACK = False
 API_KEY = os.environ.get("OPENAI_API_KEY", None)
+EXTRA = {}
 
 
 def read_text(p):
@@ -49,6 +50,16 @@ def read_text(p):
 
 def norm_list(xs):
     return sorted({(x or "").strip().lower() for x in (xs or []) if x})
+
+
+def no_reasoning_extra(model):
+    """Provider-specific params to disable thinking, keyed on model family."""
+    m = (model or "").lower()
+    if "qwen" in m:
+        return {"chat_template_kwargs": {"enable_thinking": False}}
+    if any(k in m for k in ("deepseek", "kimi", "glm", "qwq")):
+        return {"reasoning": {"enabled": False}}
+    return None
 
 
 # ---------------- Structured output models ----------------
@@ -88,6 +99,7 @@ def agent1_extract(essay_text: str) -> dict:
             model=MODEL,
             temperature=0,
             max_tokens=MAX_TOKENS,
+            extra_body=EXTRA,
             messages=[
                 {
                     "role": "system",
@@ -122,6 +134,7 @@ def agent2_score(essay_text: str, extraction: dict) -> dict:
             model=MODEL,
             temperature=0,
             max_tokens=MAX_TOKENS,
+            extra_body=EXTRA,
             messages=[
                 {"role": "system", "content": "You are Score Judge. Return JSON only."},
                 {"role": "user", "content": user_prompt},
@@ -154,6 +167,8 @@ Return JSON only: {"text": "feedback (<=80 words)"}"""
     resp = client.chat.completions.create(
         model=MODEL,
         temperature=0.5,
+        max_tokens=MAX_TOKENS,
+        extra_body=EXTRA,
         messages=[{"role": "system", "content": sys}, {"role": "user", "content": usr}],
         response_model=Feedback,
     )
@@ -255,6 +270,11 @@ if __name__ == "__main__":
         help="max output tokens (default: 8192; reasoning models need headroom)",
     )
     parser.add_argument(
+        "--reasoning",
+        action="store_true",
+        help="keep model thinking enabled (default: auto-disable when model supports it)",
+    )
+    parser.add_argument(
         "--test",
         action="store_true",
         help="consume only 1 item per set (avoid many LLM calls)",
@@ -263,8 +283,10 @@ if __name__ == "__main__":
 
     MODEL = args.model
     MAX_TOKENS = args.max_tokens
+    EXTRA = {} if args.reasoning else (no_reasoning_extra(MODEL) or {})
     client = instructor.from_openai(
-        OpenAI(api_key=API_KEY, base_url=args.base_url), mode=instructor.Mode.MD_JSON
+        OpenAI(api_key=API_KEY, base_url=args.base_url, max_retries=5),
+        mode=instructor.Mode.MD_JSON,
     )
 
     ds_names = sorted(DATASETS) if "all" in args.ds else args.ds
