@@ -1,20 +1,20 @@
 {
   "$schema": "https://opencode.ai/config.json",
-  "model": "together/tarzanchemgio-d0a4/Qwen2.5-7B-Instruct-Turbo",
+  "model": "kaggle/Qwen/Qwen2.5-7B-Instruct-AWQ",
   "provider": {
-    "together": {
+    "kaggle": {
       "options": {
         "apiKey": "{env:OPENAI_API_KEY}",
-        "baseURL": "https://api.together.ai/v1"
+        "baseURL": "https://1e9b-34-81-138-190.ngrok-free.app/v1"
       },
       "models": {
-        "tarzanchemgio-d0a4/Qwen2.5-7B-Instruct-Turbo": {
-          "name": "Qwen2.5-7B-Instruct-Turbo",
+        "Qwen/Qwen2.5-7B-Instruct-AWQ": {
+          "name": "Qwen/Qwen2.5-7B-Instruct-AWQ",
           "tool_call": true,
           "temperature": true,
           "limit": {
             "context": 32768,
-            "output": 8192
+            "output": 1024
           }
         }
       }

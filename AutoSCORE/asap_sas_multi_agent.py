@@ -221,6 +221,10 @@ def run_set(ds_name, ds, set_num, test_only, client):
             "Feedback",
         ],
     )
+    if test_only:
+        print("TEST MODE: not writing results to disk")
+        return
+
     os.makedirs(os.path.dirname(OUTPUT_CSV), exist_ok=True)
     out.to_csv(OUTPUT_CSV, index=False, encoding="utf-8-sig")
     print(f"Saved to {OUTPUT_CSV}")
