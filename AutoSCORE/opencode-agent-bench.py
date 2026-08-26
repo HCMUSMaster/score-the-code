@@ -1,8 +1,11 @@
 import argparse
+import json
 import os
 import re
 import subprocess
+import threading
 import time
+from types import SimpleNamespace
 
 import pandas as pd
 from asap_sas_multi_agent import DATASETS, discover_sets, read_text
@@ -17,21 +20,23 @@ LOG_FILE = os.path.join(PROJECT_DIR, "opencode.log")
 
 
 def build_prompt(question: str, rubric: str, essay: str) -> str:
-    return f"""Score this essay using the essay-scoring workflow: first run the rubric-extractor agent, then run the scorer agent. Do not score without running both.
-
-# Question
+    return f"""# Question
 {question}
 
 # Scoring Rubric
 {rubric}
 
 # Student Essay
-{essay}
-
-Output ONLY the final score as a single integer, alone on the last line of your reply. Nothing else after it. No markdown, no explanation after the integer."""
+{essay}"""
 
 
 def parse_score(out: str):
+    m = re.search(r"\{.*\}", out, re.DOTALL)
+    if m:
+        try:
+            return int(json.loads(m.group(0))["score"])
+        except (ValueError, KeyError, TypeError):
+            pass
     lines = [l.strip() for l in out.splitlines() if l.strip()]
     if lines:
         m = re.search(r"(\d+)", lines[-1])
@@ -43,24 +48,74 @@ def parse_score(out: str):
     return None
 
 
-def run_opencode(model: str, prompt: str, debug: bool = False):
-    cmd = ["opencode", "run", "--model", model, "--auto", prompt]
-    if os.environ.get("OPENCODE_LOG", "1") == "1":
-        cmd.append("--print-logs")
+def run_opencode(
+    model: str, prompt: str, debug: bool = False, agent: str | None = None
+):
+    cmd = ["opencode", "run", "--model", model, "--auto", "--format", "json"]
+    if agent:
+        cmd += ["--agent", agent]
+    cmd.append(prompt)
     if debug:
         cmd += ["--log-level", "DEBUG"]
-    proc = subprocess.run(
-        cmd,
-        check=False,
-        capture_output=True,
-        text=True,
-        cwd=PROJECT_DIR,
-        timeout=TIMEOUT_S,
+    with open(LOG_FILE, "a", encoding="utf-8") as logf:
+        logf.write(f"[opencode] cmd: {' '.join(cmd)}\n")
+        logf.flush()
+
+        proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            cwd=PROJECT_DIR,
+            stdin=subprocess.DEVNULL,
+            bufsize=1,
+        )
+        out_lines, err_lines = [], []
+
+        def pump(stream, lines):
+            for line in stream:
+                lines.append(line)
+                logf.write(line)
+                logf.flush()
+
+        t1 = threading.Thread(target=pump, args=(proc.stdout, out_lines))
+        t2 = threading.Thread(target=pump, args=(proc.stderr, err_lines))
+        t1.start()
+        t2.start()
+        try:
+            proc.wait(timeout=TIMEOUT_S)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
+            t1.join()
+            t2.join()
+            raise
+        t1.join()
+        t2.join()
+        logf.write(f"[opencode] returncode: {proc.returncode}\n")
+        logf.flush()
+    return SimpleNamespace(
+        returncode=proc.returncode,
+        stdout="".join(out_lines),
+        stderr="".join(err_lines),
     )
-    if (os.environ.get("OPENCODE_LOG", "1") == "1" or debug) and proc.stderr:
-        with open(LOG_FILE, "a", encoding="utf-8") as f:
-            f.write(f"[opencode] stderr:\n{proc.stderr}\n")
-    return proc
+
+
+def extract_text(out: str) -> str:
+    """Pull assistant text parts out of --format json event stream."""
+    texts = []
+    for line in out.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            evt = json.loads(line)
+        except ValueError:
+            continue
+        part = evt.get("part") or {}
+        if evt.get("type") == "text" and part.get("type") == "text":
+            texts.append(part.get("text", ""))
+    return "\n".join(t for t in texts if t)
 
 
 def score_essay(
@@ -73,17 +128,32 @@ def score_essay(
 ):
     prompt = build_prompt(question, rubric, essay)
     try:
-        proc = run_opencode(model, prompt, debug)
+        proc1 = run_opencode(model, prompt, debug, agent="rubric-extractor")
     except subprocess.TimeoutExpired:
-        print(f"[opencode] timed out after {TIMEOUT_S}s, defaulting to 0")
+        print(f"[rubric-extractor] timed out after {TIMEOUT_S}s, defaulting to 0")
         return 0, "TIMEOUT"
-    raw = proc.stdout.strip()
-    if proc.returncode != 0:
-        print(f"[opencode] exit {proc.returncode}: {proc.stderr.strip()}")
+    if proc1.returncode != 0:
+        print(f"[rubric-extractor] exit {proc1.returncode}: {proc1.stderr.strip()}")
+        return 0, extract_text(proc1.stdout)
+    evidence = extract_text(proc1.stdout).strip()
+
+    try:
+        proc2 = run_opencode(
+            model,
+            f"{prompt}\n\n# rubric-extractor evidence\n{evidence}",
+            debug,
+            agent="scorer",
+        )
+    except subprocess.TimeoutExpired:
+        print(f"[scorer] timed out after {TIMEOUT_S}s, defaulting to 0")
+        return 0, "TIMEOUT"
+    raw = extract_text(proc2.stdout).strip()
+    if proc2.returncode != 0:
+        print(f"[scorer] exit {proc2.returncode}: {proc2.stderr.strip()}")
         return 0, raw
     s = parse_score(raw)
     if s is None:
-        print("[opencode] no score parsed from output, defaulting to 0")
+        print("[scorer] no score parsed from output, defaulting to 0")
         return 0, raw
     return max(0, min(max_rating, s)), raw
 

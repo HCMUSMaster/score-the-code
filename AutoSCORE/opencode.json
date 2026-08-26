@@ -5,7 +5,7 @@
     "kaggle": {
       "options": {
         "apiKey": "{env:OPENAI_API_KEY}",
-        "baseURL": "https://1e9b-34-81-138-190.ngrok-free.app/v1"
+        "baseURL": "https://985b-136-107-173-62.ngrok-free.app/v1"
       },
       "models": {
         "Qwen/Qwen2.5-7B-Instruct-AWQ": {
@@ -14,7 +14,7 @@
           "temperature": true,
           "limit": {
             "context": 32768,
-            "output": 1024
+            "output": 4096
           }
         }
       }
