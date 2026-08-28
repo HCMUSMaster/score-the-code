@@ -3,7 +3,7 @@ import glob
 import json
 import os
 import re
-import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import instructor
 import pandas as pd
@@ -41,6 +41,7 @@ MAX_TOKENS = 8192
 WRITE_FEEDBACK = False
 API_KEY = os.environ.get("OPENAI_API_KEY", None)
 EXTRA = {}
+WORKERS = 4
 
 
 def read_text(p):
@@ -175,7 +176,7 @@ Return JSON only: {"text": "feedback (<=80 words)"}"""
     return resp.text
 
 
-def run_set(ds_name, ds, set_num, test_only, client):
+def run_set(ds_name, ds, set_num, test_only, client, workers=WORKERS):
     global PROMPT_EXTRACTOR, PROMPT_SCORING, QUESTION_TEXT, RUBRIC_TEXT, MAX_RATING
 
     set_dir = ds["prompt_dir"].format(set_num)
@@ -191,24 +192,33 @@ def run_set(ds_name, ds, set_num, test_only, client):
     if test_only:
         df = df.head(1).copy()
 
-    rows = []
-    for _, r in tqdm(df.iterrows(), total=len(df), desc=f"{ds_name}/Set{set_num}"):
-        essay = str(r[ds["essay_col"]])
+    essays = [
+        (i, str(r[ds["essay_col"]]), int(r[ds["gold_col"]])) for i, r in df.iterrows()
+    ]
+
+    def score_one(item):
+        idx, essay, gold = item
         a1 = agent1_extract(essay)
         a2 = agent2_score(essay, a1)
         fb = agent3_feedback(essay, a1, a2) if WRITE_FEEDBACK else ""
+        return {
+            "_idx": idx,
+            "EssayText": essay,
+            "Extraction": json.dumps(a1, ensure_ascii=False),
+            "PredScore": a2["score"],
+            "ScorerRaw": json.dumps(a2["raw"], ensure_ascii=False),
+            "Feedback": fb,
+            "GoldScore": gold,
+        }
 
-        rows.append(
-            {
-                "EssayText": essay,
-                "Extraction": json.dumps(a1, ensure_ascii=False),
-                "PredScore": a2["score"],
-                "ScorerRaw": json.dumps(a2["raw"], ensure_ascii=False),
-                "Feedback": fb,
-                "GoldScore": int(r[ds["gold_col"]]),
-            }
-        )
-        time.sleep(SLEEP_S)
+    rows = []
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        futures = [ex.submit(score_one, e) for e in essays]
+        for fut in tqdm(
+            as_completed(futures), total=len(futures), desc=f"{ds_name}/Set{set_num}"
+        ):
+            rows.append(fut.result())
+    rows.sort(key=lambda r: r.pop("_idx"))
 
     out = pd.DataFrame(
         rows,
@@ -283,6 +293,12 @@ if __name__ == "__main__":
         action="store_true",
         help="consume only 1 item per set (avoid many LLM calls)",
     )
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=WORKERS,
+        help=f"parallel essay workers (default: {WORKERS})",
+    )
     args = parser.parse_args()
 
     MODEL = args.model
@@ -302,4 +318,4 @@ if __name__ == "__main__":
             print(f"No prompt sets found for {ds_name}; skipping")
             continue
         for set_num in sets:
-            run_set(ds_name, ds, set_num, args.test, client)
+            run_set(ds_name, ds, set_num, args.test, client, args.workers)
