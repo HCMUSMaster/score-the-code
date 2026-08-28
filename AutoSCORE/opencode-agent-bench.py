@@ -4,7 +4,7 @@ import os
 import re
 import subprocess
 import threading
-import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from types import SimpleNamespace
 
 import pandas as pd
@@ -13,10 +13,11 @@ from tqdm import tqdm
 from utils.metrics import evaluate_all, save_metrics
 
 MODEL = "gpt-4o"
-SLEEP_S = 0.2
+WORKERS = 4
 TIMEOUT_S = 300
 PROJECT_DIR = os.path.dirname(os.path.abspath(__file__))
 LOG_FILE = os.path.join(PROJECT_DIR, "opencode.log")
+LOG_LOCK = threading.Lock()
 
 
 def build_prompt(question: str, rubric: str, essay: str) -> str:
@@ -58,8 +59,9 @@ def run_opencode(
     if debug:
         cmd += ["--log-level", "DEBUG"]
     with open(LOG_FILE, "a", encoding="utf-8") as logf:
-        logf.write(f"[opencode] cmd: {' '.join(cmd)}\n")
-        logf.flush()
+        with LOG_LOCK:
+            logf.write(f"[opencode] cmd: {' '.join(cmd)}\n")
+            logf.flush()
 
         proc = subprocess.Popen(
             cmd,
@@ -75,8 +77,9 @@ def run_opencode(
         def pump(stream, lines):
             for line in stream:
                 lines.append(line)
-                logf.write(line)
-                logf.flush()
+                with LOG_LOCK:
+                    logf.write(line)
+                    logf.flush()
 
         t1 = threading.Thread(target=pump, args=(proc.stdout, out_lines))
         t2 = threading.Thread(target=pump, args=(proc.stderr, err_lines))
@@ -92,8 +95,9 @@ def run_opencode(
             raise
         t1.join()
         t2.join()
-        logf.write(f"[opencode] returncode: {proc.returncode}\n")
-        logf.flush()
+        with LOG_LOCK:
+            logf.write(f"[opencode] returncode: {proc.returncode}\n")
+            logf.flush()
     return SimpleNamespace(
         returncode=proc.returncode,
         stdout="".join(out_lines),
@@ -140,7 +144,7 @@ def score_essay(
     try:
         proc2 = run_opencode(
             model,
-            f"{prompt}\n\n# rubric-extractor evidence\n{evidence}",
+            f"{prompt}\n\n# Agent1 (rubric-extractor) evidence — may contain errors, verify against essay and rubric\n{evidence}",
             debug,
             agent="scorer",
         )
@@ -158,7 +162,7 @@ def score_essay(
     return max(0, min(max_rating, s)), raw
 
 
-def run_set(ds_name, ds, set_num, model, test_only, debug=False):
+def run_set(ds_name, ds, set_num, model, test_only, debug=False, workers=WORKERS):
     set_dir = ds["prompt_dir"].format(set_num)
     question = read_text(f"{set_dir}/question.txt")
     rubric = read_text(f"{set_dir}/rubric.txt")
@@ -171,19 +175,18 @@ def run_set(ds_name, ds, set_num, model, test_only, debug=False):
     if test_only:
         df = df.head(1).copy()
 
-    rows = []
-    for _, r in tqdm(df.iterrows(), total=len(df), desc=f"{ds_name}/Set{set_num}"):
-        essay = str(r[ds["essay_col"]])
+    essays = [(str(r[ds["essay_col"]]), int(r[ds["gold_col"]])) for _, r in df.iterrows()]
+
+    def score_one(item):
+        essay, gold = item
         pred, raw = score_essay(model, question, rubric, essay, max_rating, debug)
-        rows.append(
-            {
-                "EssayText": essay,
-                "PredScore": pred,
-                "RawOutput": raw,
-                "GoldScore": int(r[ds["gold_col"]]),
-            }
-        )
-        time.sleep(SLEEP_S)
+        return {"EssayText": essay, "PredScore": pred, "RawOutput": raw, "GoldScore": gold}
+
+    rows = []
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        futures = [ex.submit(score_one, item) for item in essays]
+        for fut in tqdm(as_completed(futures), total=len(futures), desc=f"{ds_name}/Set{set_num}"):
+            rows.append(fut.result())
 
     if test_only:
         print("TEST MODE: not writing results to disk")
@@ -215,6 +218,19 @@ def run_set(ds_name, ds, set_num, model, test_only, debug=False):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="AutoSCORE via opencode agents")
+    parser.add_argument(
+        "--ds",
+        nargs="+",
+        choices=sorted(DATASETS) + ["all"],
+        default=["all"],
+        help="dataset(s) to run, or 'all' (default: all)",
+    )
+    parser.add_argument(
+        "--set",
+        type=int,
+        default=None,
+        help="essay set number (default: all sets in dataset)",
+    )
     parser.add_argument("--model", default=MODEL, help="model name (provider/model)")
     parser.add_argument(
         "--test",
@@ -226,13 +242,23 @@ if __name__ == "__main__":
         action="store_true",
         help="pass --log-level DEBUG to opencode and print all stderr logs",
     )
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=WORKERS,
+        help=f"parallel opencode processes (default: {WORKERS})",
+    )
     args = parser.parse_args()
 
     test_only = args.test
-    for ds_name, ds in DATASETS.items():
-        sets = discover_sets(ds)
+    ds_names = sorted(DATASETS) if "all" in args.ds else args.ds
+    for ds_name in ds_names:
+        ds = DATASETS[ds_name]
+        sets = [args.set] if args.set is not None else discover_sets(ds)
         if not sets:
             print(f"No prompt sets found for {ds_name}; skipping")
             continue
         for set_num in sets:
-            run_set(ds_name, ds, set_num, args.model, test_only, args.debug)
+            run_set(
+                ds_name, ds, set_num, args.model, test_only, args.debug, args.workers
+            )

@@ -1,44 +1,50 @@
 ---
 name: essay-scoring
-description: Score a student essay against a provided question and rubric by combining the rubric-extractor and scorer agents. Use when the user gives an essay, a question, and a rubric and wants evidence-backed scoring. Trigger on phrases like "score this essay", "grade this response", "rubric", "extract evidence then score".
+description: Score a student essay against a provided question and rubric using a two-phase extract-then-score pipeline performed directly, without subagents. Use when the user gives an essay, a question, and a rubric and wants evidence-backed scoring. Trigger on phrases like "score this essay", "grade this response", "rubric", "extract evidence then score".
 ---
 
 # Essay Scoring (extract-then-score pipeline)
 
-Score any student essay by running the two subagents in sequence: `@rubric-extractor` first, then `@scorer`. Do not score in a single ad-hoc pass — evidence extraction must precede the final decision.
+Do the full pipeline yourself in one pass — do not delegate to subagents, do not use the task tool. Evidence extraction must precede the final decision.
 
-## Step 1: rubric-extractor
+Inputs required: the question/context, the scoring rubric, and the full student essay text (verbatim). If any are missing, ask for them before starting. Do not proceed with placeholders.
 
-Invoke `@rubric-extractor` with the inputs in this order:
+## Phase 1: Extract evidence
 
-1. The question/context.
-2. The scoring rubric.
-3. The full student essay text (verbatim).
+Act as the evidence extractor. Your task: pull evidence and verbatim quotes from the student's response and map them to the provided rubric. Then suggest a score.
 
-What it returns: verbatim quotes mapped to rubric criteria, unmet criteria flagged, and a suggested score. This is a recommendation only.
+Workflow:
+1. Read the question/context and the scoring rubric carefully. Note what each rubric level requires.
+2. Scan the student essay. For every rubric criterion, collect the matching evidence as short verbatim quotes from the essay text.
+3. For each quote, state which rubric criterion it satisfies and why.
+4. Note any rubric criteria the essay fails to address.
+5. Using only what the quotes support, suggest a score and justify it against the rubric. This is a recommendation only — the final decision happens in Phase 2.
 
-## Step 2: scorer
+Rules:
+- Quotes must be verbatim from the essay. Never paraphrase inside quotation marks.
+- Only count evidence that genuinely satisfies the rubric. Do not stretch weak matches.
+- If a criterion has no supporting quote, say so explicitly. Do not invent evidence.
+- Output structured text: for each criterion, the quote(s) plus a rubric-match note, then your suggested score with justification.
+- End this phase with a single JSON object on its own line, in this exact shape (no markdown, no code fence):
+{"suggested_score": 3, "evidence": [{"criterion": "short rubric criterion name", "quote": "verbatim essay quote", "matches": true}], "missed": ["criterion name with no supporting quote"]}
 
-Invoke `@scorer` with:
+## Phase 2: Assign final score
 
-1. The same question/context.
-2. The same rubric.
-3. rubric-extractor's full evidence output (all quotes + suggested score).
-4. The original essay text, if the extractor's claims need verification.
+Act as the final decision-maker. Decide the final score by comparing the question, the rubric, and the evidence extracted in Phase 1.
 
-What it returns: the final score with justification citing rubric criteria and supporting evidence.
-
-## Handoff rules
-
-- Never skip Step 1. The scorer must see extractor evidence.
-- If the user supplies no rubric, ask for one before starting. The rubric is mandatory for both steps.
-- If the user supplies no essay or question, ask for them. Do not proceed with placeholders.
-- Preserve verbatim quotes exactly between the two agents — do not paraphrase evidence in the handoff.
-- If the extractor and scorer conflict, the scorer resolves by prioritizing essay text + rubric (per its instructions).
+Workflow:
+1. Read the question and rubric. Anchor on the rubric's definitions of each score level.
+2. Review each piece of evidence from Phase 1. Validate every quote against the original essay text.
+3. Resolve conflicts: if the Phase 1 evidence or suggested score conflicts with the rubric or the essay, re-check the essay directly and prioritize the essay text plus rubric over the extraction.
+4. Assign the final score, level by level, against the rubric. If no evidence satisfies a higher level, do not award it.
+5. Justify the final score with the specific rubric criteria and the evidence that supports or fails it.
 
 ## Output format
 
-Present to the user:
+End your reply with a single JSON object on its own line, in this exact shape (no markdown, no code fence):
+{"score": 3, "justification": "one or two sentences citing rubric criteria and supporting evidence"}
+
+Then present to the user, concisely:
 
 - The final score.
 - A short justification: which rubric criteria were met, with the supporting quotes.

@@ -1,0 +1,12 @@
+{
+  "Accuracy": "0.510",
+  "AdjAccuracy": "0.940",
+  "MAE": "0.550",
+  "MSE": "0.670",
+  "RMSE": "0.819",
+  "CohenKappa": "0.245",
+  "QWK": "0.389",
+  "Pearson": "0.400",
+  "Spearman": "0.391",
+  "KendallTau": "0.357"
+}
